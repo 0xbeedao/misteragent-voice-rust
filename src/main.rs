@@ -1,16 +1,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{traits::*, HeapRb};
+use ringbuf::HeapRb;
 use tokio;
 use actix_web::{web, App, HttpServer, HttpResponse};
-use hound;
 use log;
 use env_logger;
 use parking_lot;
 use argh::FromArgs;
 use chrono;
+use dotenv::dotenv;
+
+mod wakeword_listener;
+mod capture_audio;
+use capture_audio::{capture_audio, get_input_config};
 
 /// Audio recording application
 #[derive(FromArgs)]
@@ -43,58 +46,6 @@ impl AudioState {
     }
 }
 
-// Get the input config
-fn get_input_config() -> cpal::SupportedStreamConfig {
-    let host = cpal::default_host();
-    let device = host.default_input_device()
-        .expect("Failed to get default input device");
-    device.default_input_config()
-        .expect("Failed to get default input config")
-}
-
-// Audio capture function
-async fn capture_audio(state: Arc<AudioState>) {
-    log::info!("Initializing audio capture");
-    let host = cpal::default_host();
-    let device = host.default_input_device()
-        .expect("Failed to get default input device");
-    
-    log::info!("Using input device: {}", device.name().unwrap_or_default());
-    
-    let config = device.default_input_config()
-        .expect("Failed to get default input config");
-    
-    log::debug!("Audio config: {:?}", config);
-    
-    let state_clone = Arc::clone(&state);
-    let stream = device.build_input_stream(
-        &config.into(),
-        move |data: &[f32], _: &_| {
-            if state_clone.is_recording.load(Ordering::Relaxed) {
-                log::trace!("Recording {} samples", data.len());
-                let mut buffer = state_clone.buffer.lock();
-                for &sample in data {
-                    buffer.push_overwrite(sample);
-                }
-            }
-        },
-        |err| log::error!("Error in audio stream: {}", err),
-        Some(Duration::from_secs(1)),
-    ).expect("Failed to build input stream");
-
-    log::info!("Starting audio stream");
-    stream.play().expect("Failed to start audio stream");
-
-    // Keep the stream alive until the server is halted
-    while !state.is_halting.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    log::info!("Shutting down capture audio thread");
-    
-    // Explicitly drop the stream before the function ends
-    drop(stream);
-}
-
 // HTTP endpoint handlers
 async fn start_recording(state: web::Data<Arc<AudioState>>) -> HttpResponse {
     log::info!("Starting recording");
@@ -119,38 +70,16 @@ async fn save_audio(state: web::Data<Arc<AudioState>>) -> HttpResponse {
     let config = get_input_config();
     log::debug!("Using input config: {:?}", config);
 
-    let spec = hound::WavSpec {
-        channels: config.channels() as u16,
-        sample_rate: config.sample_rate().0,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-
-    log::debug!("Creating WAV with spec: {:?}", spec);
-
-    // Create output directory if it doesn't exist
-    if let Some(parent) = filepath.parent() {
-        std::fs::create_dir_all(parent)
-            .expect("Failed to create output directory");
+    match capture_audio::save_audio_to_file(&state, &filepath, &config) {
+        Ok(sample_count) => {
+            log::info!("Successfully saved {} samples to {}", sample_count, filepath.display());
+            HttpResponse::Ok().body(format!("Audio saved to {}", filepath.display()))
+        }
+        Err(e) => {
+            log::error!("Failed to save audio: {}", e);
+            HttpResponse::InternalServerError().body(format!("Failed to save audio: {}", e))
+        }
     }
-
-    let mut writer = hound::WavWriter::create(&filepath, spec)
-        .expect("Failed to create WAV file");
-
-    // Convert ring buffer to vec and write to file
-    let buffer_contents: Vec<f32> = {
-        let buffer = state.buffer.lock();
-        buffer.iter().copied().collect()
-    };
-    
-    log::info!("Writing {} samples to WAV file", buffer_contents.len());
-    for &sample in &buffer_contents {
-        writer.write_sample(sample).expect("Failed to write sample");
-    }
-
-    writer.finalize().expect("Failed to finalize WAV file");
-    log::info!("Successfully saved audio to {}", filepath.display());
-    HttpResponse::Ok().body(format!("Audio saved to {}", filepath.display()))
 }
 
 async fn halt_server(state: web::Data<Arc<AudioState>>) -> HttpResponse {
@@ -163,12 +92,17 @@ async fn halt_server(state: web::Data<Arc<AudioState>>) -> HttpResponse {
     // Give a brief moment for the recording thread to clean up
     tokio::time::sleep(Duration::from_millis(200)).await;
     HttpResponse::Ok().body("Server halted");
+    // wait for response
+    tokio::time::sleep(Duration::from_millis(500)).await;
     // Exit process cleanly
     std::process::exit(0);
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Load environment variables from .env file
+    dotenv().ok();
+
     // Get command line arguments
     let args: Args = argh::from_env();
     
